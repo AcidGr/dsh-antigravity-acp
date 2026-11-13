@@ -1311,36 +1311,16 @@ window.__ModuleLoader__.load({
             ),
           'antigravity-acp: settings section',
         )
-        // 额度药丸：紧邻模型选择器左侧（宿主把 conversation.input.right 渲染在
-        // conversation.input.model 之前）。modelDirectories 是会话模型目录服务。
+        // [本地定制] 已移除 conversation.input.right 的额度药丸注册。
         //
-        // 注意：这里**不能**把 `remote.agyQuota` 写进 inject。贡献型 remote 的客户端
-        // 服务要等 `ctx.remote.$mount(...)`（见 apply 里那段）完成后才存在，写进 inject
-        // 会让整个注册回调一直等待 —— 表现为**药丸彻底消失**（2026-10-17 实测踩过）。
-        // 正确做法是照常注册 slot，由读取器短轮询等服务出现。
-        ctx.inject(['slots', 'modelDirectories'], (scope) => {
-          // 读取器按 scope 建一次：药丸的取数 effect 依赖 readQuota 的身份，若每次
-          // inject 都新建函数，身份变化会让 effect 反复重跑、重复触发 Host 侧 CLI 取数。
-          scope.effect(
-            () =>
-              scope.slots.inject('conversation.input.right', () =>
-                scope.slots.register(
-                  {
-                    name: 'conversation.input.right',
-                    id: PILL_ID,
-                    order: 1002,
-                    inject: (sessionId) => ({
-                      store: scope.modelDirectories.directoryFor(sessionId).store,
-                      readQuota,
-                      proxyControl,
-                    }),
-                  },
-                  AgYQuotaPill,
-                ),
-              ),
-            'antigravity-acp: quota pill',
-          )
-        })
+        // 原实现把 AgYQuotaPill 插到模型选择器左侧，与宿主自带的模型选择胶囊并排，
+        // 让输入栏出现两个胶囊。本部署不需要在对话界面常驻额度显示，额度统一在
+        // 「设置 → Antigravity ACP → 额度」卡片里手动「拉取额度」查看，
+        // 因此这里不再注册该 slot，输入栏保持宿主原本的样式。
+        //
+        // 设置页卡片（settings.section，见上）不受影响：它持有自己的 readQuota，
+        // 且仅在用户点击「拉取额度」时才请求一次，不会自动轮询。
+        // AgYQuotaPill 组件与其取数逻辑保留在文件内，便于将来恢复。
       },
     }
   },

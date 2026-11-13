@@ -4,6 +4,11 @@
 
 记录源码与发布内容，不将本地构建、npm 发布和本机升级混为同一状态。日期采用 Asia/Hong_Kong。更早历史见 [Git 提交记录](https://github.com/KouzakiUmi/dsh-antigravity-acp/commits/main/)。
 
+## 本地定制 · 2026-11-14
+
+- **额度不再常驻对话输入栏**：移除 `conversation.input.right` 的额度药丸注册，输入栏恢复宿主原本样式（仅保留自带的模型选择胶囊）。额度统一在「设置 → Antigravity ACP → 额度」卡片查看，卡片仅在点击「拉取额度」时请求一次，不自动轮询。`AgYQuotaPill` 组件与其取数逻辑保留在源码内以便将来恢复，但不再注册到任何槽位。
+- 同步删除随之失效的胶囊测试（`client-loader` 的 AI Credits / 药丸 / 拆信封 / remote 挂载四组，以及 `client-interaction` 的 `quota pill with real React state` 整组），测试数 843 → 809。设置卡片自身的读取器与手动刷新行为仍由既有用例覆盖。
+
 ## 0.1.38 · 2026-11-12
 
 - **无档位模型不再产出非法元数据**：目录里没有思考强度变体的家族 id 之前返回 `reasoning: { efforts: [] }`，宿主把空数组判为 `INVALID_MODEL_REASONING` 并让该模型完全不可用；现在改为省略 `reasoning`（不支持档位就是不声明菜单）。

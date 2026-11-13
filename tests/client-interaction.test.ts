@@ -56,7 +56,8 @@ function loadCard(quotaRead?: () => Promise<unknown>) {
     inject: (_names: string[], callback: (scope: unknown) => void) => callback(ctx),
   }
   registration!.factory(() => React).apply(ctx)
-  return { Card: components.get('antigravity-acp')!, Pill: components.get('antigravity-quota')!, intervals,
+  // [本地定制] 额度药丸已移除，仅设置卡片参与测试。
+  return { Card: components.get('antigravity-acp')!, intervals,
     reader: injections.get('antigravity-acp')!().readQuota as SharedQuotaReader }
 }
 
@@ -86,18 +87,6 @@ async function mount(remote: unknown, control?: unknown, proxyControl?: unknown,
   return { renderer, intervals }
 }
 
-async function mountPill(readQuota: unknown) {
-  const { Pill } = loadCard()
-  const modelSnapshot = { current: { provider: 'antigravity-acp', model: 'gemini-flash' } }
-  const store = {
-    subscribe: () => () => {},
-    getSnapshot: () => modelSnapshot,
-  }
-  let renderer!: ReactTestRenderer
-  await act(async () => { renderer = create(React.createElement(Pill, { store, readQuota })) })
-  renderers.push(renderer)
-  return renderer
-}
 
 function button(renderer: ReactTestRenderer, label: string): ReactTestInstance {
   return renderer.root.findAllByType('button').find((node) => node.children.join('') === label || node.props['aria-label'] === label)!
@@ -110,108 +99,6 @@ function modelControl(renderer: ReactTestRenderer, kind: 'enabled' | 'effort' | 
   return renderer.root.findByProps({ name: `model-${kind}-${id}` })
 }
 function renderedText(renderer: ReactTestRenderer): string { return JSON.stringify(renderer.toJSON()) }
-
-describe('quota pill with real React state and effects', () => {
-  it('设置页关闭时，实际共享读取器仍随代理退出和换账户清空并更新药丸', async () => {
-    let snapshot = { phase: 'signed-in', revision: 1 }
-    const quotaRead = vi.fn(async () => snapshot.phase === 'signed-in'
-      ? { status: 'ok', groups: [{ name: 'Gemini', buckets: [{ window: '5h', remainingPct: snapshot.revision === 1 ? 81 : 34 }] }] }
-      : { status: 'error', groups: [], error: { message: '代理账户未登录' } })
-    const { Pill, intervals, reader } = loadCard(quotaRead)
-    const proxyControl = async () => ({ snapshot })
-    const store = { subscribe: () => () => {}, getSnapshot: () => state }
-    const state = { current: { provider: 'antigravity-proxy', model: 'antigravity-gemini-3.8-flash' } }
-    let renderer!: ReactTestRenderer
-    await act(async () => { renderer = create(React.createElement(Pill, { store, readQuota: reader, proxyControl })) })
-    renderers.push(renderer)
-    expect(renderer.root.findByProps({ role: 'progressbar' }).props['aria-valuenow']).toBe(81)
-    snapshot = { phase: 'signed-out', revision: 2 }
-    await act(async () => { for (const timer of intervals.values()) if (timer.delay === 3000) timer.callback() })
-    expect(renderer.root.findAllByProps({ role: 'progressbar' })).toHaveLength(0)
-    snapshot = { phase: 'signed-in', revision: 3 }
-    await act(async () => { for (const timer of intervals.values()) if (timer.delay === 3000) timer.callback() })
-    expect(renderer.root.findByProps({ role: 'progressbar' }).props['aria-valuenow']).toBe(34)
-    expect(quotaRead).toHaveBeenCalledTimes(3)
-  })
-  it('共享额度读取器通知自身时也结束刷新，可再次手动刷新', async () => {
-    const listeners = new Set<(value: unknown, source: unknown) => void>()
-    const snapshot = { status: 'ok', groups: [{ name: 'Gemini', buckets: [{ window: '5h', remainingPct: 82 }] }] }
-    const readQuota = Object.assign(vi.fn(async (_force: boolean, source: unknown) => {
-      for (const listener of listeners) listener(snapshot, source)
-      return snapshot
-    }), { subscribe: (listener: (value: unknown, source: unknown) => void) => { listeners.add(listener); return () => listeners.delete(listener) } })
-    const renderer = await mountPill(readQuota)
-    await act(async () => { await renderer.root.findByProps({ 'aria-haspopup': 'dialog' }).props.onClick() })
-    expect(button(renderer, '刷新额度').props.disabled).toBe(false)
-    await act(async () => { await button(renderer, '刷新额度').props.onClick() })
-    expect(readQuota).toHaveBeenCalledTimes(2)
-    expect(button(renderer, '刷新额度').props.disabled).toBe(false)
-    await act(async () => { renderer.root.findByProps({ 'aria-label': '关闭额度详情' }).props.onClick() })
-    expect(renderer.root.findAllByProps({ role: 'dialog' })).toHaveLength(0)
-  })
-  it('ACP 与代理切换时清除旧额度并立即取新数据，代理模型可匹配额度组', async () => {
-    const { Pill } = loadCard()
-    const pending = deferred<unknown>()
-    let snapshot = { current: { provider: 'antigravity-acp', model: 'gemini-flash' } }
-    const listeners = new Set<() => void>()
-    const store = { subscribe: (listener: () => void) => { listeners.add(listener); return () => { listeners.delete(listener) } }, getSnapshot: () => snapshot }
-    const readQuota = vi.fn(async () => ({ status: 'ok', groups: [{ name: 'Gemini', buckets: [{ window: '5h', remainingPct: 82 }] }] }) as unknown)
-    readQuota.mockImplementationOnce(async () => ({ status: 'ok', groups: [{ name: 'Gemini', buckets: [{ window: '5h', remainingPct: 82 }] }] }))
-    readQuota.mockImplementationOnce(() => pending.promise)
-    let renderer!: ReactTestRenderer
-    await act(async () => { renderer = create(React.createElement(Pill, { store, readQuota })) })
-    renderers.push(renderer)
-    expect(renderer.root.findByProps({ role: 'progressbar' }).props['aria-valuenow']).toBe(82)
-    await act(async () => {
-      snapshot = { current: { provider: 'antigravity-proxy', model: 'antigravity-gemini-3.8-flash' } }
-      for (const listener of listeners) listener()
-    })
-    expect(readQuota).toHaveBeenCalledTimes(2)
-    expect(renderer.root.findAllByProps({ role: 'progressbar' })).toHaveLength(0)
-    await act(async () => { pending.resolve({ status: 'ok', groups: [{ name: 'Gemini', buckets: [{ window: '5h', remainingPct: 42 }] }] }) })
-    expect(renderer.root.findByProps({ role: 'progressbar' }).props['aria-valuenow']).toBe(42)
-  })
-
-  it('跨家族官方映射使用实际路由模型的额度组', async () => {
-    const renderer = await mountPill(async () => ({
-      status: 'ok', requestedModel: 'gemini-flash', routeModel: 'claude-opus-5-5-low',
-      groups: [
-        { name: 'Gemini', buckets: [{ window: '5h', remainingPct: 81 }] },
-        { name: 'Claude and GPT models', buckets: [{ window: '5h', remainingPct: 42 }] },
-      ],
-    }))
-    expect(renderer.root.findByProps({ role: 'progressbar' }).props['aria-valuenow']).toBe(42)
-  })
-
-  it('失败信封转成可读错误，不把异常抛出组件', async () => {
-    const renderer = await mountPill(async () => ({ ok: false, error: { message: 'remote denied' } }))
-    expect(renderer.root.findByProps({ 'aria-haspopup': 'dialog' }).props['aria-label']).toContain('额度读取失败')
-    await act(async () => { await renderer.root.findByProps({ 'aria-haspopup': 'dialog' }).props.onClick() })
-    expect(renderedText(renderer)).toContain('remote denied')
-  })
-
-  it('刷新异常保留成功快照并标缓存，后续成功清除缓存标记', async () => {
-    let fail = false
-    const snapshot = { status: 'ok', updatedAt: '2026-10-25T00:00:00Z', groups: [
-      { name: 'Gemini Models', buckets: [{ window: '5h', remainingPct: 82 }] },
-    ] }
-    const readQuota = vi.fn(async () => {
-      if (fail) throw new Error('refresh timeout')
-      return snapshot
-    })
-    const renderer = await mountPill(readQuota)
-    await act(async () => { await renderer.root.findByProps({ 'aria-haspopup': 'dialog' }).props.onClick() })
-    expect(renderedText(renderer)).toContain('82')
-    fail = true
-    await act(async () => { await button(renderer, '刷新额度').props.onClick() })
-    expect(renderedText(renderer)).toContain('缓存数据 · Error: refresh timeout')
-    expect(renderedText(renderer)).toContain('82')
-    fail = false
-    await act(async () => { await button(renderer, '刷新额度').props.onClick() })
-    expect(renderedText(renderer)).not.toContain('缓存数据')
-    expect(renderedText(renderer)).toContain('82')
-  })
-})
 
 describe('settings card with real React state and effects', () => {
   it('实际共享读取器丢弃旧账户的迟到广播，不覆盖新账户已成功额度', async () => {
