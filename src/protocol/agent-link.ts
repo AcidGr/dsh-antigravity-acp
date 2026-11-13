@@ -528,8 +528,12 @@ export class AgentLink {
   async newSession(request: NewSessionRequest, options?: AgentLinkRequestOptions): Promise<NewSessionResponse> {
     this.#requireInitialized('session/new')
     for (const server of request.mcpServers) {
+      // [本地修改] agy 1.5.x 的 initialize 响应不携带 agentCapabilities.mcpCapabilities，
+      // 但它实际完整支持 HTTP MCP：实测 session/new 接受 http 条目、主动 server/discover、
+      // 拉 tools/list 并发出 tools/call。上游漏报能力 ≠ 不支持能力，因此这里把
+      // 「未声明即拒绝」降级为「未声明即告警，交由 session/new 的实际握手裁决」。
       if ('type' in server && server.type === 'http' && this.#initializeResponse?.agentCapabilities?.mcpCapabilities?.http !== true) {
-        throw new AgentLinkError(AGY_LINK_ERROR.UNSUPPORTED_CAPABILITY, 'ACP 服务端未声明 HTTP MCP 支持，无法安全接入 DSH 工具')
+        this.#handlers.onProtocolViolation?.('ACP 服务端未声明 HTTP MCP 能力（agy 1.5.x 已知漏报）；已放行，由 session/new 实际握手裁决')
       }
       if ('type' in server && server.type === 'sse' && this.#initializeResponse?.agentCapabilities?.mcpCapabilities?.sse !== true) {
         throw new AgentLinkError(AGY_LINK_ERROR.UNSUPPORTED_CAPABILITY, 'ACP 服务端未声明 SSE MCP 支持')

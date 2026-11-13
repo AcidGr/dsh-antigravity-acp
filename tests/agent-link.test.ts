@@ -254,19 +254,29 @@ describe('AgentLink v1 能力协商', () => {
     await link.close()
   })
 
-  it('未声明 HTTP MCP 或图像能力时在发请求之前明确拒绝', async () => {
+  it('未声明 HTTP MCP 时放行并由握手裁决，图像能力仍在发请求前拒绝', async () => {
     const pair = fakePair()
     const methods: string[] = []
+    const violations: string[] = []
     pumpAgent(pair, async (message, reply) => {
       methods.push(message.method!)
+      if (message.method === 'session/new') {
+        await reply({ jsonrpc: '2.0', id: message.id!, result: { sessionId: 'live' } })
+        return
+      }
       await reply({ jsonrpc: '2.0', id: message.id!, result: { protocolVersion: 1, agentCapabilities: {} } })
     })
-    const link = new AgentLink({ stream: pair.stream })
+    const link = new AgentLink({ stream: pair.stream, handlers: { onProtocolViolation: (d) => violations.push(d) } })
     link.start()
     await link.initialize()
-    await expect(link.newSession({ cwd: '/tmp', mcpServers: [{ type: 'http', name: 'tools', url: 'http://127.0.0.1:1/mcp', headers: [] }] })).rejects.toMatchObject({ code: AGY_LINK_ERROR.UNSUPPORTED_CAPABILITY })
+    // [本地修改] agy 1.5.x 漏报 mcpCapabilities 但实际支持 HTTP MCP：放行并留痕，不再抛错。
+    await expect(
+      link.newSession({ cwd: '/tmp', mcpServers: [{ type: 'http', name: 'tools', url: 'http://127.0.0.1:1/mcp', headers: [] }] }),
+    ).resolves.toMatchObject({ sessionId: 'live' })
+    expect(violations.some((d) => d.includes('未声明 HTTP MCP'))).toBe(true)
+    // 图像能力缺失仍然拒绝：该路径由 prompt 自行校验，与 MCP 声明无关。
     await expect(link.prompt({ sessionId: 'test', prompt: [{ type: 'image', data: 'AA==', mimeType: 'image/png' }] })).rejects.toMatchObject({ code: AGY_LINK_ERROR.UNSUPPORTED_CAPABILITY })
-    expect(methods).toEqual(['initialize'])
+    expect(methods).toEqual(['initialize', 'session/new'])
     await link.close()
   })
 })

@@ -28,7 +28,7 @@ import { mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises'
 import { randomUUID } from 'node:crypto'
 import { homedir as osHomedir } from 'node:os'
 import { join } from 'node:path'
-import { parseTokenState, refreshAccessToken, resolveOAuthClient } from './quota.js'
+import { parseTokenState, refreshAccessToken, refreshAccessTokenWithClients, resolveOAuthClients, resolveOAuthClient } from './quota.js'
 import type { OAuthClientMeta, QuotaTokenState } from './quota.js'
 import { redactSensitiveText } from './redact.js'
 
@@ -416,14 +416,32 @@ export async function ensureAcpCredentials(deps: AcpCredentialDeps = {}): Promis
   return { ...base, ready: true, status: source, settingsWritten }
 }
 
-/** 默认换发实现：走 quota.ts 的 OAuth 刷新。 */
+/**
+ * 默认换发实现：走 quota.ts 的 OAuth 刷新。
+ *
+ * [本地修改] 先用调用方给定的 client 换发；若它无权换发（agy 1.5.x 二进制内嵌多组
+ * client，只有一组属于本机登录态），再用二进制里解析出的其余候选逐个重试，避免因
+ * 单个 client 失配就整条链路降级。
+ */
 async function refreshWithDefaults(
   state: QuotaTokenState,
   client: OAuthClientMeta,
   env: Readonly<Record<string, string | undefined>>,
   fetchImpl?: typeof fetch,
 ): Promise<QuotaTokenState> {
-  return refreshAccessToken(state, client, { env, ...(fetchImpl ? { fetchImpl } : {}) })
+  const deps = { env, ...(fetchImpl ? { fetchImpl } : {}) }
+  try {
+    return await refreshAccessToken(state, client, deps)
+  } catch (error) {
+    const retryable = error instanceof Error && 'status' in error
+      && [400, 401, 403].includes((error as { status?: number }).status ?? 0)
+    if (!retryable) throw error
+    const others = (await resolveOAuthClients(deps)).filter(
+      (meta) => meta.clientId !== client.clientId || meta.clientSecret !== client.clientSecret,
+    )
+    if (others.length === 0) throw error
+    return refreshAccessTokenWithClients(state, others, deps)
+  }
 }
 
 /** 错误文案只保留类型与消息，绝不回显任何 token 片段。 */

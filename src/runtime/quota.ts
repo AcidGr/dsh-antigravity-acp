@@ -25,6 +25,27 @@ import { agyCliCandidates } from './agy-cli.js'
 
 /** Cloud Code Assist 内部端点前缀（方法以 `:method` 拼接，POST JSON）。 */
 export const CODE_ASSIST_BASE_URL = 'https://daily-cloudcode-pa.googleapis.com/v1internal'
+
+/**
+ * [本地修改] Cloud Code Assist 的客户端身份 User-Agent。
+ *
+ * 实测：不带 UA 调用 `v1internal:loadCodeAssist` 时，上游返回
+ * `{ allowedTiers, ineligibleTiers }`——**没有 `cloudaicompanionProject`**，等于把请求
+ * 当匿名客户端判为「无资格档位」。带 agy CLI 形态的 UA 时才返回
+ * `{ currentTier, cloudaicompanionProject: 'aicode-consumers', paidTier: 'g1-pro-tier' }`。
+ *
+ * 插件此前的 `postCodeAssist` 只发 Authorization / Content-Type / Accept，因此额度面板
+ * 一直误报「loadCodeAssist 未返回 cloudaicompanionProject」，而对话链路（走 ACP 子进程，
+ * UA 由官方二进制自己带）完全正常。这里补齐 UA，与 agy 1.3.x 线上身份一致。
+ */
+const ANTIGRAVITY_CLI_VERSION = '1.3.5'
+const ANTIGRAVITY_CLI_CHANGE_LIST = '998863838'
+
+function codeAssistUserAgent(): string {
+  const osType = process.platform === 'win32' ? 'windows' : process.platform || 'unknown'
+  const arch = process.arch === 'x64' ? 'amd64' : process.arch === 'ia32' ? '386' : process.arch || 'unknown'
+  return `antigravity/cli/${ANTIGRAVITY_CLI_VERSION} (aidev_client; os_type=${osType}; arch=${arch}; cl=${ANTIGRAVITY_CLI_CHANGE_LIST}; auth_method=consumer)`
+}
 /** Google OAuth 2.0 token 端点（换发 access token）。 */
 export const OAUTH_TOKEN_URL = 'https://oauth2.googleapis.com/token'
 /** 官方 CLI 登录态文件（只读）。 */
@@ -248,6 +269,49 @@ export function parseOAuthClientFromBinary(text: string): OAuthClientMeta | unde
 }
 
 /**
+ * [本地修改] 从官方二进制文本里提取 OAuth client 候选组合。
+ *
+ * 为什么需要：`agy` 1.5.x 把多组 OAuth client 打进同一个二进制，**且 id 段与 secret 段
+ * 在文件里分开存放**（实测 1.5.8：三个 secret 位于 ~102.86M，三个 id 位于 ~103.6M），
+ * 相对位置无法用于配对。旧实现固定取「最后一条 id + 其后第一个 secret」，在 1.5.8 上
+ * 必然配错，换发返回 401 unauthorized_client，错误又被上层包装成
+ * 「loadCodeAssist 未返回 cloudaicompanionProject」，表现为额度面板报错但对话正常。
+ *
+ * 实测 3 个 id × 3 个 secret = 9 种组合里只有 1 种能换发本机登录态。因此这里枚举
+ * 全部组合，由 `refreshAccessTokenWithClients` 逐个尝试、谁成功用谁；不硬编码任何
+ * client，`agy` 下次升级换了组合也能自适应。
+ *
+ * 已配对形态（id 与 secret 相邻，旧启发式可靠）排在前面，减少无谓的 401 尝试。
+ */
+export function parseOAuthClientsFromBinary(text: string): OAuthClientMeta[] {
+  const ids = [...new Set(text.match(/\d+-[a-z0-9]+\.apps\.googleusercontent\.com/g) ?? [])]
+  const secrets = [...new Set(text.match(/GOCSPX-[A-Za-z0-9_-]{28}/g) ?? [])]
+  if (ids.length === 0 || secrets.length === 0) return []
+  const out: OAuthClientMeta[] = []
+  const seen = new Set<string>()
+  const push = (clientId: string, clientSecret: string): void => {
+    const key = `${clientId}\u0000${clientSecret}`
+    if (seen.has(key)) return
+    seen.add(key)
+    out.push({ clientId, clientSecret })
+  }
+  // 先放「相邻配对」的猜想（老版本二进制里 id 与 secret 紧邻，这里能直接命中）。
+  for (const clientId of [...ids].reverse()) {
+    const anchor = text.lastIndexOf(clientId)
+    const near = secrets
+      .map((secret) => ({ secret, at: text.indexOf(secret, anchor + 1) }))
+      .filter((entry) => entry.at > anchor)
+      .sort((a, b) => a.at - b.at)[0]
+    if (near) push(clientId, near.secret)
+  }
+  // 再补全全部组合，覆盖 id/secret 分段存放的形态。
+  for (const clientId of [...ids].reverse()) {
+    for (const secret of secrets) push(clientId, secret)
+  }
+  return out
+}
+
+/**
  * 解析 OAuth client 元数据：环境变量优先，其次扫描官方二进制。
  * 两者都拿不到就返回 undefined —— 由调用方报「无法换发 token」，绝不编造 client。
  */
@@ -267,6 +331,36 @@ export async function resolveOAuthClient(deps: QuotaDeps = {}): Promise<OAuthCli
     }
   }
   return undefined
+}
+
+/**
+ * [本地修改] 收集**全部**可用的 OAuth client 候选，按尝试顺序返回。
+ *
+ * 环境变量显式指定时排第一且立即返回（尊重用户覆盖）；否则扫二进制里所有可配对的
+ * client，逐个保留。空数组表示完全拿不到元数据，由调用方报 `refresh-unavailable`。
+ */
+export async function resolveOAuthClients(deps: QuotaDeps = {}): Promise<OAuthClientMeta[]> {
+  const env = deps.env ?? process.env
+  const envClientId = env.AGY_OAUTH_CLIENT_ID?.trim()
+  const envClientSecret = env.AGY_OAUTH_CLIENT_SECRET?.trim()
+  if (envClientId && envClientSecret) return [{ clientId: envClientId, clientSecret: envClientSecret }]
+  const readFileImpl = deps.readFileImpl ?? defaultReadBinary
+  const out: OAuthClientMeta[] = []
+  const seen = new Set<string>()
+  for (const candidate of await candidateBinaryPaths(deps)) {
+    try {
+      const text = await readFileImpl(candidate)
+      for (const meta of parseOAuthClientsFromBinary(text)) {
+        const key = `${meta.clientId}\u0000${meta.clientSecret}`
+        if (seen.has(key)) continue
+        seen.add(key)
+        out.push(meta)
+      }
+    } catch {
+      // 读不到就试下一个候选；提取失败不是致命错误。
+    }
+  }
+  return out
 }
 
 /** 官方二进制候选：缓存里的 agy_acp_server + 本机官方 agy CLI。
@@ -305,6 +399,43 @@ async function candidateBinaryPaths(deps: QuotaDeps): Promise<string[]> {
 
 /** 用 refresh_token 换发 access_token（只在内存中使用，不写回登录文件）。 */
 export async function refreshAccessToken(
+  state: QuotaTokenState,
+  client: OAuthClientMeta,
+  deps: QuotaDeps = {},
+): Promise<QuotaTokenState> {
+  return refreshAccessTokenWithClients(state, [client], deps)
+}
+
+/**
+ * [本地修改] 依次用候选 client 尝试换发，返回第一个成功的结果。
+ *
+ * 401 / 403 说明该 client 无权换发这个 refresh_token（`agy` 1.5.x 二进制里打了多组
+ * client，只有一组属于本机登录态），换下一组继续；其他错误（网络、5xx）直接抛出，
+ * 因为换 client 也不会改善。全部失败时抛出最后一组的错误，并保留原始 HTTP 状态。
+ */
+export async function refreshAccessTokenWithClients(
+  state: QuotaTokenState,
+  clients: readonly OAuthClientMeta[],
+  deps: QuotaDeps = {},
+): Promise<QuotaTokenState> {
+  if (clients.length === 0) {
+    throw new QuotaError('refresh-unavailable', '没有可用的 OAuth client 元数据')
+  }
+  let lastError: unknown
+  for (const client of clients) {
+    try {
+      return await refreshAccessTokenWithClient(state, client, deps)
+    } catch (error) {
+      lastError = error
+      const retryable = error instanceof QuotaError && error.code === 'refresh-failed'
+        && (error.status === 401 || error.status === 403 || error.status === 400)
+      if (!retryable) throw error
+    }
+  }
+  throw lastError instanceof Error ? lastError : new QuotaError('refresh-failed', '换发 access token 失败')
+}
+
+async function refreshAccessTokenWithClient(
   state: QuotaTokenState,
   client: OAuthClientMeta,
   deps: QuotaDeps = {},
@@ -446,12 +577,13 @@ async function fetchQuotaSnapshotUncached(deps: QuotaDeps): Promise<QuotaSnapsho
       return failure(stamp(), 'token-missing', '官方 CLI 登录态里没有可用 token，请先在 Antigravity 登录')
     }
     if (!isTokenUsable(state, now())) {
-      const client = await resolveOAuthClient(deps)
-      if (!client) {
+      // [本地修改] 用全部候选 client 逐个尝试：agy 1.5.x 内嵌多组 client，只有一组能换发。
+      const clients = await resolveOAuthClients(deps)
+      if (clients.length === 0) {
         return failure(stamp(), 'refresh-unavailable', 'access token 已过期且无法取得 OAuth client 元数据（可设 AGY_OAUTH_CLIENT_ID/SECRET）')
       }
       try {
-        state = await refreshAccessToken(state, client, deps)
+        state = await refreshAccessTokenWithClients(state, clients, deps)
       } catch (error) {
         return failure(stamp(), 'refresh-failed', describeError(error))
       }
@@ -485,9 +617,9 @@ async function retryAfterRefresh(
   deps: QuotaDeps,
 ): Promise<QuotaSnapshot> {
   try {
-    const client = await resolveOAuthClient(deps)
-    if (!client) return failure(stamp(), 'refresh-unavailable', '请求被拒（401/403）且无法取得 OAuth client 元数据')
-    const refreshed = await refreshAccessToken(state, client, deps)
+    const clients = await resolveOAuthClients(deps)
+    if (clients.length === 0) return failure(stamp(), 'refresh-unavailable', '请求被拒（401/403）且无法取得 OAuth client 元数据')
+    const refreshed = await refreshAccessTokenWithClients(state, clients, deps)
     const project = await loadCodeAssist(refreshed.accessToken as string, deps)
     const summary = await postCodeAssist(
       'retrieveUserQuotaSummary',
@@ -522,6 +654,8 @@ async function postCodeAssist(
         Authorization: `Bearer ${accessToken}`,
         'Content-Type': 'application/json',
         Accept: 'application/json',
+        // [本地修改] 必须带 agy CLI 身份，否则上游按匿名客户端返回 ineligibleTiers（无 project）。
+        'User-Agent': codeAssistUserAgent(),
       },
       body: JSON.stringify(payload),
       signal: timeoutSignal(deps),
