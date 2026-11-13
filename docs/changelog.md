@@ -6,7 +6,7 @@
 
 ## 本地定制 · 2026-11-14
 
-- **额度不再常驻对话输入栏**：移除 `conversation.input.right` 的额度药丸注册，输入栏恢复宿主原本样式（仅保留自带的模型选择胶囊）。额度统一在「设置 → Antigravity ACP → 额度」卡片查看，卡片仅在点击「拉取额度」时请求一次，不自动轮询。`AgYQuotaPill` 组件与其取数逻辑保留在源码内以便将来恢复，但不再注册到任何槽位。
+- **额度药丸彻底移除**：删除 `AgYQuotaPill` 组件、`useQuota` 取数钩子、`quotaPillStatus`、`PILL_ID` 及 `conversation.input.right` 注册，输入栏恢复宿主原本样式（仅保留自带的模型选择胶囊），client.js 减少约 166 行。额度统一在「设置 → Antigravity ACP → 额度」卡片查看，卡片仅在点击「拉取额度」时请求一次，不自动轮询。此部署不合并上游，组件不保留恢复入口。
 - 同步删除随之失效的胶囊测试（`client-loader` 的 AI Credits / 药丸 / 拆信封 / remote 挂载四组，以及 `client-interaction` 的 `quota pill with real React state` 整组），测试数 843 → 809。设置卡片自身的读取器与手动刷新行为仍由既有用例覆盖。
 
 ## 0.1.38 · 2026-11-12

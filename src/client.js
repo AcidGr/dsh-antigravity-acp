@@ -762,14 +762,6 @@ window.__ModuleLoader__.load({
             h('div', { style: { marginTop: '16px', paddingTop: '14px', borderTop: '1px solid rgba(128,128,128,.14)' } },
               account?.runtime ? RuntimeDetails({ runtime: account.runtime }) : h('p', { style: { margin: 0, fontSize: '12px', opacity: .6 } }, '连接后显示运行详情。'))) : null))
     }
-
-    /**
-     * 额度药丸：只在当前会话模型属于 antigravity-acp 时出现，位置是
-     * `conversation.input.right`（宿主 InputBar 里它渲染在模型选择器之前，
-     * 即「Provider 选择器左边」）。取数经 Host 的 remote.agyQuota.read。
-     */
-    const PILL_ID = 'antigravity-quota'
-
     const TRACK = 'rgba(128,128,128,.18)'
     const CARD = { padding: '12px', borderRadius: '12px', border: '1px solid rgba(128,128,128,.18)', background: 'rgba(128,128,128,.05)' }
     const PANEL = { padding: '14px', borderRadius: '12px', border: '1px solid rgba(128,128,128,.16)', background: 'rgba(128,128,128,.025)' }
@@ -827,49 +819,6 @@ window.__ModuleLoader__.load({
         ...(unknown ? { 'aria-valuetext': bucket.disabled ? '已停用' : '额度未知' } : { 'aria-valuenow': pct }),
         style: { display: 'block', width: compact ? '34px' : '100%', height: compact ? compactHeight + 'px' : '4px', borderRadius: '99px', overflow: 'hidden', background: TRACK },
       }, h('span', { style: { display: 'block', height: '100%', width: unknown ? '100%' : pct + '%', opacity: unknown ? .35 : 1, borderRadius: '99px', background: tone(bucket, stale) } }))
-    }
-    function useQuota(readQuota, enabled = true, source, model) {
-      const [data, setData] = React.useState(null)
-      const [refreshing, setRefreshing] = React.useState(false)
-      const version = React.useRef(0)
-      const currentSource = React.useRef(source)
-      const currentModel = React.useRef(model)
-      currentModel.current = model
-      const update = React.useCallback((value) => setData(value), [])
-      const load = React.useCallback((force = false) => {
-        if (!enabled || !readQuota) return Promise.resolve()
-        const current = ++version.current
-        setRefreshing(true)
-        return Promise.resolve().then(() => readQuota(force, source, model)).then(unwrap).then((value) => {
-          if (current === version.current) update(value)
-        }).catch((error) => {
-          if (current === version.current) {
-            const message = error instanceof Error ? error.message : String(error)
-            setData((previous) => previous?.status === 'ok'
-              ? { ...previous, stale: true, staleReason: message }
-              : { status: 'error', groups: [], error: { message } })
-          }
-        }).finally(() => { if (current === version.current) setRefreshing(false) })
-      }, [readQuota, enabled, update, source, model])
-      React.useEffect(() => {
-        currentSource.current = source
-        setData(null)
-        if (!enabled || !readQuota) { setData(null); return undefined }
-        void load(false)
-        const off = readQuota.subscribe?.((value, origin) => {
-          if (origin !== undefined && origin !== source) return
-          if (value?.requestedModel !== undefined && value.requestedModel !== currentModel.current) return
-          if (value === null) {
-            ++version.current; update(null); setRefreshing(false)
-            void load(true)
-            return
-          }
-          ++version.current; update(value); setRefreshing(false)
-        })
-        const timer = setInterval(() => { if (typeof document === 'undefined' || document.visibilityState !== 'hidden') void load(false) }, 300_000)
-        return () => { ++version.current; clearInterval(timer); off?.() }
-      }, [load, enabled, readQuota, update, source, model])
-      return { data: currentSource.current === source ? data : null, refreshing, load }
     }
     function CreditsDetails({ credits, pending }) {
       // 只隐藏「未开启」这一种主动关闭状态；开关已开但 CLI 缺失/不支持/上游无数据
@@ -958,100 +907,6 @@ window.__ModuleLoader__.load({
           h('small', { style: { flex: 1, opacity: .5, minWidth: 0, fontSize: '10px' } }, data?.updatedAt ? '更新于 ' + new Date(data.updatedAt).toLocaleString() : '尚无成功快照'),
           load ? h('button', { type: 'button', disabled: refreshing, onClick: () => load(true), style: { ...ACTION, minHeight: '27px', padding: '3px 9px', fontSize: '11px' } }, refreshing ? '刷新中…' : '刷新额度') : null))
     }
-    /** 紧凑余量条与单词状态的交互参考 dsh-subusage；取数仍由本插件负责。 */
-    function quotaPillStatus(data, buckets) {
-      if (!data) return { short: '', icon: '…', color: '#8b909a' }
-      if (data.status === 'error') return { short: '失败', icon: '!', color: '#e5534b', tint: true }
-      if (data.stale) return { short: '缓存', icon: '!', color: '#d99b28', tint: true }
-      const usable = buckets.filter(bucket => !bucket.disabled && percentage(bucket) !== undefined)
-      if (!usable.length) return { short: buckets.some(bucket => bucket.disabled) ? '受限' : '未知', icon: '?', color: '#8b909a' }
-      const minimum = Math.min(...usable.map(percentage))
-      if (minimum === 0) return { short: '已用尽', color: '#e5534b', tint: true }
-      if (minimum <= 10) return { short: '紧张', color: '#e5534b', tint: true }
-      if (minimum <= 25) return { short: '偏少', color: '#d99b28', tint: true }
-      return { short: '', color: '#25b879' }
-    }
-    function AgYQuotaPill({ store, readQuota, proxyControl }) {
-      const state = React.useSyncExternalStore(store.subscribe, store.getSnapshot, store.getSnapshot)
-      const isAcp = state?.current?.provider === PROVIDER
-      const isProxy = state?.current?.provider === PROXY_PROVIDER
-      const enabled = isAcp || isProxy
-      const model = state?.current?.model
-      const quota = useQuota(readQuota, enabled, state?.current?.provider, model)
-      const [expanded, setExpanded] = React.useState(false)
-      const [position, setPosition] = React.useState(null)
-      const root = React.useRef(null)
-      const button = React.useRef(null)
-      React.useEffect(() => {
-        if (!isProxy || !proxyControl) return
-        let active = true
-        let pending = false
-        const check = async () => {
-          if (pending) return
-          pending = true
-          try {
-            const value = unwrap(await proxyControl('account', { action: 'status' }))
-            if (active) readQuota?.observeProxyAccount?.(value.snapshot)
-          } catch { /* 账户轮询失败不覆盖额度查询自身的结果。 */ }
-          finally { pending = false }
-        }
-        void check()
-        const timer = setInterval(() => {
-          if (typeof document === 'undefined' || document.visibilityState !== 'hidden') void check()
-        }, 3000)
-        return () => { active = false; clearInterval(timer) }
-      }, [isProxy, proxyControl, readQuota])
-      React.useEffect(() => { setExpanded(false) }, [enabled])
-      React.useEffect(() => {
-        if (!expanded) { setPosition(null); return undefined }
-        const reposition = () => {
-          if (!button.current?.getBoundingClientRect) return
-          const rect = button.current.getBoundingClientRect()
-          const viewport = document.documentElement.clientWidth
-          const height = window.innerHeight
-          const width = Math.min(340, viewport - 24)
-          const above = rect.top - 20
-          const below = height - rect.bottom - 20
-          setPosition({ position: 'fixed', right: 'auto', width,
-            left: Math.max(12, Math.min(rect.right - width, viewport - width - 12)),
-            ...(above >= Math.min(480, below)
-              ? { bottom: height - rect.top + 8, maxHeight: Math.max(32, above) }
-              : { bottom: 'auto', top: rect.bottom + 8, maxHeight: Math.max(32, below) }),
-          })
-        }
-        reposition()
-        window.addEventListener('resize', reposition)
-        window.addEventListener('scroll', reposition, true)
-        const outside = (event) => { if (!root.current?.contains(event.target)) setExpanded(false) }
-        const key = (event) => { if (event.key === 'Escape') { setExpanded(false); button.current?.focus() } }
-        document.addEventListener('pointerdown', outside)
-        document.addEventListener('keydown', key)
-        return () => { document.removeEventListener('pointerdown', outside); document.removeEventListener('keydown', key); window.removeEventListener('resize', reposition); window.removeEventListener('scroll', reposition, true) }
-      }, [expanded])
-      if (!enabled) return null
-      const groups = quotaGroups(quota.data)
-      const family = modelGroup(quota.data?.routeModel ?? model)
-      // 官方 /usage 可能只报告 Gemini 共享额度；只有真实 Argon 分组存在时，
-      // 才把 Argon 型号绑定到独立组，不能命中一个预建的空组而误报未知。
-      const group = groups.find((g) => g.key === family && (family !== 'argon' || g.buckets.length > 0))
-        ?? (family === 'argon' ? groups.find((g) => g.key === 'gemini') : undefined)
-      const buckets = group?.buckets ?? []
-      const pillStatus = quotaPillStatus(quota.data, buckets)
-      const miniBuckets = buckets.slice(0, 5)
-      const miniHeight = miniBuckets.length <= 1 ? 6 : miniBuckets.length === 2 ? 5 : miniBuckets.length === 3 ? 4 : miniBuckets.length === 4 ? 3 : 2
-      const modeTag = isProxy ? '代理' : 'ACP'
-      const label = quota.data?.status === 'error' ? '额度读取失败' : !quota.data ? '正在读取额度' : !group ? '额度未匹配，请选择具体模型' : !buckets.length ? '额度未知' : buckets.map((b) => windowName(b) + ' ' + (b.disabled ? '已停用' : percentage(b) === undefined ? '额度未知' : Math.round(percentage(b)) + '% 剩余')).join(' · ')
-      const title = modeTag + ' · ' + String(model ?? '未选择模型') + ' · ' + label + (quota.data?.stale ? ' · 缓存数据' : '')
-      return h('span', { ref: root, className: 'antigravity-usage-pill', 'data-expanded': String(expanded), style: { position: 'relative', display: 'inline-flex', alignItems: 'center' } },
-        h('button', { ref: button, type: 'button', title, 'aria-label': title, 'aria-expanded': expanded, 'aria-haspopup': 'dialog', onClick: () => setExpanded((value) => !value),
-          style: { display: 'inline-flex', alignItems: 'center', justifyContent: 'center', gap: '8px', padding: pillStatus.short ? '4px 11px 4px 9px' : '5px 10px', minHeight: '26px', boxSizing: 'border-box', borderRadius: '99px', border: '1px solid ' + (pillStatus.tint ? pillStatus.color + '73' : 'rgba(128,128,128,.3)'), background: pillStatus.tint ? pillStatus.color + '1a' : 'transparent', color: 'inherit', cursor: 'pointer', font: 'inherit', fontSize: '12px', fontWeight: 600, whiteSpace: 'nowrap', maxWidth: 'min(46vw, 240px)' } },
-          miniBuckets.length ? h('span', { style: { display: 'grid', gap: miniBuckets.length <= 2 ? '3px' : '2px', opacity: quota.data?.stale ? .5 : 1 } }, ...miniBuckets.map((b, i) => h('span', { key: i }, remainingBar(b, true, quota.data?.stale, group.name + ' ' + windowName(b) + '剩余额度', miniHeight))))
-            : h('span', { 'aria-hidden': true, style: { display: 'inline-flex', alignItems: 'center', justifyContent: 'center', width: '16px', height: '16px', borderRadius: '50%', background: pillStatus.color, color: '#fff', fontSize: '11px' } }, pillStatus.icon),
-          pillStatus.short ? h('span', null, pillStatus.short) : null),
-        expanded ? h('div', { role: 'dialog', 'aria-label': 'Antigravity 额度详情', style: { position: 'absolute', bottom: 'calc(100% + 8px)', right: 0, zIndex: 50, width: 'min(340px, calc(100vw - 24px))', maxHeight: 'min(70vh, calc(100vh - 72px))', overflowY: 'auto', boxSizing: 'border-box', overflowWrap: 'anywhere', padding: '12px', borderRadius: '12px', background: 'var(--dsh-surface, Canvas)', color: 'var(--dsh-text, CanvasText)', border: '1px solid rgba(128,128,128,.28)', boxShadow: '0 12px 32px rgba(0,0,0,.28)', fontSize: '12px', ...position } },
-          QuotaDetails({ ...quota, model, source: state?.current?.provider, onClose: () => { setExpanded(false); button.current?.focus?.() } })) : null)
-    }
-
     /** 给 promise 加超时：Host 侧异常时界面也要落到可读错误，而不是永远 pending。 */
     function withTimeout(promise, ms, message) {
       let timer
@@ -1311,16 +1166,15 @@ window.__ModuleLoader__.load({
             ),
           'antigravity-acp: settings section',
         )
-        // [本地定制] 已移除 conversation.input.right 的额度药丸注册。
+        // [本地定制] 额度药丸已彻底移除（组件、取数与 conversation.input.right 注册全部删除）。
         //
         // 原实现把 AgYQuotaPill 插到模型选择器左侧，与宿主自带的模型选择胶囊并排，
         // 让输入栏出现两个胶囊。本部署不需要在对话界面常驻额度显示，额度统一在
         // 「设置 → Antigravity ACP → 额度」卡片里手动「拉取额度」查看，
-        // 因此这里不再注册该 slot，输入栏保持宿主原本的样式。
+        // 因此这里不注册该 slot，输入栏保持宿主原本的样式。
         //
         // 设置页卡片（settings.section，见上）不受影响：它持有自己的 readQuota，
         // 且仅在用户点击「拉取额度」时才请求一次，不会自动轮询。
-        // AgYQuotaPill 组件与其取数逻辑保留在文件内，便于将来恢复。
       },
     }
   },
